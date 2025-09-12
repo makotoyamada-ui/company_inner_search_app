@@ -5,7 +5,7 @@
 ############################################################
 # ライブラリの読み込み
 ############################################################
-from langchain_community.document_loaders import PyMuPDFLoader, Docx2txtLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_community.document_loaders.csv_loader import CSVLoader
 
 
@@ -24,7 +24,7 @@ DOC_SOURCE_ICON = ":material/description: "
 LINK_SOURCE_ICON = ":material/link: "
 WARNING_ICON = ":material/warning:"
 ERROR_ICON = ":material/error:"
-SPINNER_TEXT = "回答生成中..."
+SPINNER_TEXT = "しばらくお待ちください。回答生成中です..."
 
 
 # ==========================================
@@ -40,7 +40,7 @@ APP_BOOT_MESSAGE = "アプリが起動されました。"
 # LLM設定系
 # ==========================================
 MODEL = "gpt-4o-mini"
-TEMPERATURE = 0.5
+TEMPERATURE = 0.0 #一覧の回答性を抑えるため0.0固定
 
 
 # ==========================================
@@ -48,10 +48,12 @@ TEMPERATURE = 0.5
 # ==========================================
 RAG_TOP_FOLDER_PATH = "./data"
 SUPPORTED_EXTENSIONS = {
-    ".pdf": PyMuPDFLoader,
-    ".docx": Docx2txtLoader,
-    ".csv": lambda path: CSVLoader(path, encoding="utf-8")
+    ".pdf":  lambda path: PyPDFLoader(path),                    # PDF→pageメタ付き
+    ".docx": lambda path: Docx2txtLoader(path),
+    ".csv":  lambda path: CSVLoader(path, encoding="utf-8"),
+    ".txt":  lambda path: TextLoader(path, encoding="utf-8"),   # ← 追加
 }
+
 WEB_URL_LOAD_TARGETS = [
     "https://generative-ai.web-camp.io/"
 ]
@@ -86,6 +88,9 @@ SYSTEM_PROMPT_INQUIRY = """
     5. マークダウン記法で回答する際にhタグの見出しを使う場合、最も大きい見出しをh3としてください。
     6. 複雑な質問の場合、各項目についてそれぞれ詳細に回答してください。
     7. 必要と判断した場合は、以下の文脈に基づかずとも、一般的な情報を回答してください。
+    8. 一覧やリストを求められた場合、該当する項目を最大10件まで表形式で列挙し、見落としがある場合は“他◯名あり”と補足する。
+    9. 社員名簿（部署ごと）を最優先の根拠とし、該当部署の全員を表形式で列挙（最大10件）
+    
 
     {context}
 """
@@ -110,3 +115,17 @@ NO_DOC_MATCH_MESSAGE = """
 CONVERSATION_LOG_ERROR_MESSAGE = "過去の会話履歴の表示に失敗しました。"
 GET_LLM_RESPONSE_ERROR_MESSAGE = "回答生成に失敗しました。"
 DISP_ANSWER_ERROR_MESSAGE = "回答表示に失敗しました。"
+
+# ====== チャンク分割関連 ======
+CHUNK_SIZE = 800          # 1チャンクの最大文字数
+CHUNK_OVERLAP = 50        # チャンクの重なり幅
+
+# ====== 検索関連 ======
+RETRIEVER_TOP_K = 8       # 取得する関連ドキュメント数（一覧やリストを求められた場合に最大10件まで回答するため、8件程度が妥当と判断）
+
+# ==========================================
+# バッチサイズの定数化
+# ==========================================
+EMBEDDING_MODEL = "text-embedding-3-small"  # 速くて安い、十分高品質
+EMBEDDING_BATCH_SIZE = 64                   # 64なら余裕で上限内
+

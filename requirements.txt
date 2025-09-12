@@ -1,4 +1,24 @@
-streamlit
-python-dotenv
-openai
-langchain
+# --- core ---
+streamlit>=1.36
+python-dotenv>=1.0.1
+
+# --- LangChain stack ---
+langchain==0.3.17
+langchain-community==0.3.16
+langchain-openai==0.3.3
+openai==1.60.2
+tiktoken>=0.7.0
+
+# --- vector store ---
+chromadb==0.5.0
+
+# --- loaders / parsing ---
+pypdf>=4.2.0
+docx2txt>=0.8
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+pandas>=2.2.2
+
+# --- Cloud で sqlite が無いときの保険 ---
+pysqlite3-binary>=0.5.3
+

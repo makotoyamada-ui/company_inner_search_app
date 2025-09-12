@@ -5,6 +5,16 @@
 ############################################################
 # ライブラリの読み込み
 ############################################################
+
+# --- sqlite fallback for Streamlit Cloud（最上部に置く）---
+try:
+    import pysqlite3   # requirements.txt に pysqlite3-binary を入れてある
+    import sys
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except Exception:
+    pass
+# --- ここまで ---
+
 import os
 import logging
 from logging.handlers import TimedRotatingFileHandler
@@ -19,6 +29,9 @@ from langchain.text_splitter import CharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 import constants as ct
+import re
+import csv
+from langchain.schema import Document as LCDocument 
 
 
 ############################################################
@@ -26,6 +39,11 @@ import constants as ct
 ############################################################
 # 「.env」ファイルで定義した環境変数の読み込み
 load_dotenv()
+
+# Cloud では .env は使わないため、Secrets を優先して環境変数に流し込む
+import os
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 
 ############################################################
@@ -102,40 +120,53 @@ def initialize_retriever():
     """
     画面読み込み時にRAGのRetriever（ベクターストアから検索するオブジェクト）を作成
     """
-    # ロガーを読み込むことで、後続の処理中に発生したエラーなどがログファイルに記録される
     logger = logging.getLogger(ct.LOGGER_NAME)
 
-    # すでにRetrieverが作成済みの場合、後続の処理を中断
     if "retriever" in st.session_state:
         return
     
-    # RAGの参照先となるデータソースの読み込み
+    # 参照データ読み込み
     docs_all = load_data_sources()
 
-    # OSがWindowsの場合、Unicode正規化と、cp932（Windows用の文字コード）で表現できない文字を除去
+    # 文字化け対策
     for doc in docs_all:
         doc.page_content = adjust_string(doc.page_content)
         for key in doc.metadata:
             doc.metadata[key] = adjust_string(doc.metadata[key])
     
-    # 埋め込みモデルの用意
-    embeddings = OpenAIEmbeddings()
+    # 埋め込みモデル
+    embeddings = OpenAIEmbeddings(model=ct.EMBEDDING_MODEL)
     
-    # チャンク分割用のオブジェクトを作成
+    # 分割器
+    from constants import CHUNK_SIZE, CHUNK_OVERLAP, RETRIEVER_TOP_K
     text_splitter = CharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         separator="\n"
     )
 
-    # チャンク分割を実施
-    splitted_docs = text_splitter.split_documents(docs_all)
+    # ==== ここがポイント ====
+    # 分割禁止ドキュメントは取り分け、分割対象のみsplitする
+    no_split_docs = [d for d in docs_all if d.metadata.get("no_split")]
+    split_targets = [d for d in docs_all if not d.metadata.get("no_split")]
 
-    # ベクターストアの作成
-    db = Chroma.from_documents(splitted_docs, embedding=embeddings)
+    splitted_docs = text_splitter.split_documents(split_targets)
+    # 分割禁止のものはそのまま追加（部署ごと1ドキュメントの名簿など）
+    splitted_docs.extend(no_split_docs)
+    # ==== ここまで ====
 
-    # ベクターストアを検索するRetrieverの作成
-    st.session_state.retriever = db.as_retriever(search_kwargs={"k": 3})
+    # ベクターストア作成
+    db = Chroma(embedding_function=embeddings)
+
+    # 小分けで安全に追加（トークン上限対策）
+    BATCH = ct.EMBEDDING_BATCH_SIZE  # 例: 64
+    for i in range(0, len(splitted_docs), BATCH):
+        db.add_documents(splitted_docs[i:i+BATCH])
+
+    # Retriever
+    st.session_state.retriever = db.as_retriever(search_kwargs={"k": RETRIEVER_TOP_K})
+
+
 
 
 def initialize_session_state():
@@ -202,6 +233,134 @@ def recursive_file_check(path, docs_all):
 def file_load(path, docs_all):
     """
     ファイル内のデータ読み込み
+    """
+    file_extension = os.path.splitext(path)[1]
+    file_name = os.path.basename(path)
+
+    # --- 部署名の正規化（人事/人事課/HR → 人事部 など） ---
+    def _normalize_dept(s: str) -> str:
+        if s is None:
+            return "不明"
+        s = str(s).strip()
+        # 半角/全角スペース除去
+        s = re.sub(r"[ \u3000]", "", s)
+        # 代表的な表記ゆれを吸収（必要に応じて増やしてください）
+        if any(x in s for x in ["人事", "人事課", "HR", "ＨＲ", "HumanResources"]):
+            return "人事部"
+        if "総務" in s:
+            return "総務部"
+        return s or "不明"
+
+    # --- 特別扱い: 社員名簿.csv は『部署ごとに1ドキュメント』へ統合し、分割禁止（no_split） ---
+    if file_extension == ".csv" and file_name == "社員名簿.csv":
+        try:
+            with open(path, encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                fieldnames = reader.fieldnames or (rows[0].keys() if rows else [])
+
+            if not rows:
+                return
+
+            # 列名のゆらぎ対応
+            def pick(colnames, candidates):
+                for c in candidates:
+                    if c in colnames:
+                        return c
+                return None
+
+            dept_key = pick(fieldnames, ["部署", "部門", "所属", "部署名", "Department"])
+            id_key   = pick(fieldnames, ["社員ID", "従業員ID", "社員番号", "ID"])
+            name_key = pick(fieldnames, ["氏名（フルネーム）", "氏名", "名前", "従業員名", "社員名", "Name"])
+            mail_key = pick(fieldnames, ["メールアドレス", "メール", "Email", "E-mail"])
+            role_key = pick(fieldnames, ["役職", "職位", "ポジション", "役割"])
+            skill_key= pick(fieldnames, ["スキルセット", "スキル", "Skill", "Skills"])
+
+            # 部署ごとにグルーピング（正規化してから）
+            groups = {}
+            for r in rows:
+                raw_dept = (r.get(dept_key) or "不明") if dept_key else "不明"
+                dept = _normalize_dept(raw_dept)
+                groups.setdefault(dept, []).append(r)
+
+            # 件数をログへ（統合できているか確認用）
+            logging.getLogger(ct.LOGGER_NAME).info(
+                {"roster_by_dept_counts": {k: len(v) for k, v in groups.items()}}
+            )
+
+            # 各部署ごとに1ドキュメント（no_split=True）
+            for dept, members in groups.items():
+                lines = []
+                lines.append(f"【部署:{dept} の社員一覧】（{len(members)}名）")
+
+                # 検索用タグ（人事部は表記ゆれも付与）
+                if dept == "人事部":
+                    lines.append("以下は社員名簿の統合ビューです。検索用タグ: [部署:人事部] [部署:人事] [部署:HR]")
+                else:
+                    lines.append("以下は社員名簿の統合ビューです。検索用タグ: " + f"[部署:{dept}]")
+                lines.append("")
+
+                for r in members:
+                    parts = []
+                    def add(label, key):
+                        if key and r.get(key):
+                            parts.append(f"{label}:{str(r.get(key)).strip()}")
+
+                    add("社員ID", id_key)
+                    add("氏名",   name_key)
+                    add("メール", mail_key)
+                    add("役職",   role_key)
+                    add("スキル", skill_key)
+
+                    # すべての列も残してヒット率UP
+                    for k in fieldnames:
+                        v = (r.get(k) or "").strip()
+                        if v != "" and k not in {id_key, name_key, mail_key, role_key, skill_key}:
+                            parts.append(f"{k}:{v}")
+
+                    # 検索タグ
+                    parts.append(f"[部署:{dept}]")
+                    if dept == "人事部":
+                        parts.append("[部署:人事]")
+                        parts.append("[部署:HR]")
+                    if name_key and r.get(name_key):
+                        parts.append(f"[氏名:{str(r.get(name_key)).strip()}]")
+
+                    lines.append("- " + " | ".join(parts))
+
+                content = "\n".join(lines)
+                docs_all.append(
+                    LCDocument(
+                        page_content=content,
+                        metadata={"source": path, "dept": dept, "no_split": True}
+                    )
+                )
+            return  # ここで終了（通常処理に落とさない）
+
+        except Exception:
+            # 失敗時は従来ローダーにフォールバック
+            loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
+            docs_all.extend(loader.load())
+            return
+
+    # --- 通常処理（PDF/DOCX/TXT/その他CSV） ---
+    if file_extension in ct.SUPPORTED_EXTENSIONS:
+        loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
+        docs = loader.load()
+
+        # PDFなどで "page" が別名のときに正規化
+        for d in docs:
+            if "page" not in d.metadata:
+                if "page_number" in d.metadata and isinstance(d.metadata["page_number"], int):
+                    d.metadata["page"] = d.metadata["page_number"]
+
+        docs_all.extend(docs)
+
+
+    # ▲ ここまで追記
+    
+    """
+    ファイル内のデータ読み込み
 
     Args:
         path: ファイルパス
@@ -218,6 +377,7 @@ def file_load(path, docs_all):
         loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
         docs = loader.load()
         docs_all.extend(docs)
+        
 
 
 def adjust_string(s):
